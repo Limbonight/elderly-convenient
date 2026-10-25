@@ -1,5 +1,6 @@
 import { logger } from '@lark-apaas/client-toolkit/logger';
 import { axiosForBackend } from '@lark-apaas/client-toolkit/utils/getAxiosForBackend';
+import { getDemoElderUserId } from './appointments';
 
 export interface Patient {
   id: string;
@@ -16,8 +17,20 @@ export async function getPatients(): Promise<Patient[]> {
     const response = await axiosForBackend({
       url: '/api/patients',
       method: 'GET',
+      params: { userId: getDemoElderUserId() },
     });
-    return response.data;
+    // 服务端返回 { items: [...] }，字段为 fullName/relationship，映射为客户端结构
+    const data = response.data;
+    const items = Array.isArray(data) ? data : (data?.items ?? []);
+    return items.map((row: Record<string, unknown>) => ({
+      id: String(row.id),
+      name: String(row.fullName ?? ''),
+      idCard: String(row.idCard ?? ''),
+      medicalCardNo: row.medicalCardNo ? String(row.medicalCardNo) : undefined,
+      phone: row.phone ? String(row.phone) : undefined,
+      relation: row.relationship ? String(row.relationship) : undefined,
+      isDefault: Boolean(row.isDefault),
+    }));
   } catch (error) {
     logger.error('获取就诊人列表失败', error);
     throw error;

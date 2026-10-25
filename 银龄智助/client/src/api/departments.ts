@@ -14,7 +14,9 @@ export async function getDepartments(): Promise<Department[]> {
       url: '/api/departments',
       method: 'GET',
     });
-    return response.data;
+    // 服务端返回 { items: [...] }，兼容直接返回数组的情况
+    const data = response.data;
+    return Array.isArray(data) ? data : (data?.items ?? []);
   } catch (error) {
     logger.error('获取科室列表失败', error);
     throw error;

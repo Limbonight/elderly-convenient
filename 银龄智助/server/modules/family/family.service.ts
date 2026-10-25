@@ -27,6 +27,7 @@ import type {
 import type {
   CreateFamilyBindingDto,
   CreateNotificationDto,
+  UpdateFamilyBindingDto,
 } from './dto';
 
 @Injectable()
@@ -162,6 +163,115 @@ export class FamilyService {
     if (result.length === 0) {
       throw new NotFoundException('绑定记录不存在');
     }
+  }
+
+  /**
+   * 子女端"我的父母"列表：返回绑定的老人摘要信息
+   */
+  async listMembers(
+    familyUserId: string,
+  ): Promise<{
+    items: Array<{
+      id: string;
+      name: string;
+      relation: string;
+      phone: string;
+      idCard: string;
+    }>;
+  }> {
+    const results = await this.db
+      .select({
+        id: familyBindings.id,
+        elderName: users.fullName,
+        elderPhone: users.phone,
+        relationship: familyBindings.relationship,
+      })
+      .from(familyBindings)
+      .innerJoin(users, eq(familyBindings.elderUserId, users.id))
+      .where(
+        and(
+          eq(familyBindings.familyUserId, familyUserId),
+          eq(familyBindings.isActive, true),
+        ),
+      )
+      .orderBy(desc(familyBindings.createdAt));
+
+    return {
+      items: results.map((r) => ({
+        id: r.id,
+        name: r.elderName,
+        relation: r.relationship ?? 'other',
+        phone: r.elderPhone ?? '',
+        idCard: '',
+      })),
+    };
+  }
+
+  /**
+   * 修改绑定的老人信息：同步更新 users 表中的姓名/手机号，以及绑定关系
+   */
+  async updateBinding(
+    id: string,
+    dto: UpdateFamilyBindingDto,
+  ): Promise<FamilyBinding> {
+    return this.db.transaction(async (tx) => {
+      const bindingResults = await tx
+        .select()
+        .from(familyBindings)
+        .where(eq(familyBindings.id, id))
+        .limit(1);
+      const binding = bindingResults[0];
+      if (!binding) {
+        throw new NotFoundException('绑定记录不存在');
+      }
+
+      // 更新老人用户信息
+      const userUpdate: { fullName?: string; phone?: string } = {};
+      if (dto.elderName !== undefined && dto.elderName !== '') {
+        userUpdate.fullName = dto.elderName;
+      }
+      if (dto.elderPhone !== undefined && dto.elderPhone !== '') {
+        userUpdate.phone = dto.elderPhone;
+      }
+      if (Object.keys(userUpdate).length > 0) {
+        await tx
+          .update(users)
+          .set(userUpdate)
+          .where(eq(users.id, binding.elderUserId));
+
+        // 同步更新老年端就诊人信息，保证子女端修改后老年端挂号时看到的是新信息
+        const patientUpdate: { fullName?: string; phone?: string } = {};
+        if (userUpdate.fullName) patientUpdate.fullName = userUpdate.fullName;
+        if (userUpdate.phone) patientUpdate.phone = userUpdate.phone;
+        await tx
+          .update(patients)
+          .set(patientUpdate)
+          .where(eq(patients.userId, binding.elderUserId));
+      }
+
+      // 更新绑定关系
+      if (dto.relationship !== undefined && dto.relationship !== '') {
+        await tx
+          .update(familyBindings)
+          .set({ relationship: dto.relationship })
+          .where(eq(familyBindings.id, id));
+      }
+
+      const [updatedUser] = await tx
+        .select({ fullName: users.fullName })
+        .from(users)
+        .where(eq(users.id, binding.elderUserId))
+        .limit(1);
+
+      return {
+        id: binding.id,
+        familyUserId: binding.familyUserId,
+        elderUserId: binding.elderUserId,
+        elderName: updatedUser?.fullName ?? binding.elderUserId,
+        relationship: dto.relationship ?? binding.relationship,
+        isActive: binding.isActive ?? true,
+      };
+    });
   }
 
   async listNotifications(

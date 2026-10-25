@@ -1,34 +1,24 @@
-import {
-  IsString,
-  IsOptional,
-  IsInt,
-  IsBoolean,
-  IsUUID,
-  MaxLength,
-} from 'class-validator';
+import { IsString, IsOptional, IsInt, IsBoolean, MaxLength } from 'class-validator';
 import type { CreateAppointmentRequest } from '@shared/api.interface';
 
 export class CreateAppointmentDto implements CreateAppointmentRequest {
+  // 本地/演示模式下 userId 为前端固定字符串（demo_elder_001），放宽为可选字符串
+  @IsOptional()
   @IsString()
-  @IsUUID()
-  userId: string;
+  userId?: string;
 
   @IsString()
-  @IsUUID()
-  patientId: string;
+  patientId!: string;
 
   @IsString()
-  @IsUUID()
-  departmentId: string;
+  departmentId!: string;
 
   @IsOptional()
   @IsString()
-  @IsUUID()
   doctorId?: string;
 
   @IsString()
-  @IsUUID()
-  timeSlotId: string;
+  timeSlotId!: string;
 
   @IsOptional()
   @IsBoolean()

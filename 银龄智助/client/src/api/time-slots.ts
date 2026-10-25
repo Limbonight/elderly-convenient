@@ -20,12 +20,21 @@ export async function getTimeSlots(params: {
   doctorId?: string;
 }): Promise<TimeSlot[]> {
   try {
+    if (params.doctorId) {
+      const byDoctor = await axiosForBackend({
+        url: `/api/doctors/${params.doctorId}/time-slots`,
+        method: 'GET',
+      });
+      const doctorData = byDoctor.data;
+      return Array.isArray(doctorData) ? doctorData : (doctorData?.items ?? []);
+    }
     const response = await axiosForBackend({
-      url: '/api/time-slots',
+      url: `/api/departments/${params.departmentId}/time-slots`,
       method: 'GET',
-      params,
     });
-    return response.data;
+    // 服务端返回 { items: [...] }，兼容直接返回数组的情况
+    const data = response.data;
+    return Array.isArray(data) ? data : (data?.items ?? []);
   } catch (error) {
     logger.error('获取号源列表失败', error);
     throw error;

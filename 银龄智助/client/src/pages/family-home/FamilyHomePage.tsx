@@ -3,6 +3,7 @@ import { useNavigate } from 'react-router-dom';
 import { logger } from '@lark-apaas/client-toolkit/logger';
 import {
   UserPlus,
+  UserPen,
   Bell,
   ClipboardList,
   Send,
@@ -92,6 +93,7 @@ const FamilyHomePage: React.FC = () => {
   const [members, setMembers] = useState<FamilyMember[]>([]);
   const [notifications, setNotifications] = useState<FamilyNotification[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
+  const [usingDemoData, setUsingDemoData] = useState<boolean>(false);
 
   useEffect(() => {
     const userId = getDemoFamilyUserId();
@@ -105,10 +107,12 @@ const FamilyHomePage: React.FC = () => {
         ]);
         setMembers(memberRes);
         setNotifications(notifRes.filter((n: FamilyNotification) => !n.read).slice(0, 3));
+        setUsingDemoData(false);
       } catch (error) {
         logger.warn('接口不可用，使用演示数据', error);
         setMembers(mockMembers);
         setNotifications(mockNotifications);
+        setUsingDemoData(true);
       } finally {
         setLoading(false);
       }
@@ -120,6 +124,11 @@ const FamilyHomePage: React.FC = () => {
   const handleViewRecords = (member: FamilyMember): void => {
     logger.info('查看挂号记录', { memberId: member.id });
     navigate('/elder/records');
+  };
+
+  const handleEditMember = (member: FamilyMember): void => {
+    logger.info('修改父母信息', { memberId: member.id });
+    navigate(`/family/bind?edit=${encodeURIComponent(member.id)}`);
   };
 
   const handleSendNotify = (member: FamilyMember): void => {
@@ -146,6 +155,13 @@ const FamilyHomePage: React.FC = () => {
         <h1 className="text-[#1A1A1A] text-3xl font-bold mb-2">家人健康管家</h1>
         <p className="text-base text-gray-600">远程守护父母健康，挂号、通知、协助一站式管理</p>
       </div>
+
+      {/* 接口不可用时的演示数据提示 */}
+      {usingDemoData && (
+        <div className="bg-amber-50 border border-amber-300 rounded-xl px-4 py-3 text-sm text-amber-800">
+          ⚠️ 当前显示的是演示数据（服务暂不可用），此时的修改不会保存。请稍后刷新重试。
+        </div>
+      )}
 
       {/* 快速操作区 */}
       <div className="grid grid-cols-2 gap-4" data-ai-section-type="card-menu">
@@ -242,6 +258,15 @@ const FamilyHomePage: React.FC = () => {
                   </div>
                 </CardHeader>
                 <CardFooter className="pt-0 flex gap-2">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="flex-1 text-sm"
+                    onClick={() => handleEditMember(member)}
+                  >
+                    <UserPen className="w-4 h-4 mr-1.5" />
+                    修改信息
+                  </Button>
                   <Button
                     variant="outline"
                     size="sm"

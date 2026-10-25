@@ -28,8 +28,9 @@ export class AppointmentsController {
   }
 
   @Post()
-  async create(@Body() dto: CreateAppointmentDto): Promise<Appointment> {
-    return this.appointmentsService.create(dto);
+  async create(@Body() dto: CreateAppointmentDto, @Req() req: Request): Promise<Appointment> {
+    const userId = dto.userId ?? req.userContext?.userId ?? 'demo_elder_001';
+    return this.appointmentsService.create({ ...dto, userId });
   }
 
   @Get(':id')

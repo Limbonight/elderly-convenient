@@ -52,6 +52,9 @@ export interface TimeSlot {
   totalQuota: number;
   remainingQuota: number;
   fee: string;
+  doctorName?: string;
+  doctorTitle?: string;
+  departmentName?: string;
 }
 
 export type AppointmentStatus = 'pending' | 'confirmed' | 'cancelled' | 'completed';
@@ -149,7 +152,7 @@ export interface VoiceDetectResponse {
 
 // 挂号创建请求
 export interface CreateAppointmentRequest {
-  userId: string;
+  userId?: string;
   patientId: string;
   departmentId: string;
   doctorId?: string;

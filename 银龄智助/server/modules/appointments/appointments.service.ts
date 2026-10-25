@@ -7,7 +7,15 @@ import {
   BadRequestException,
 } from '@nestjs/common';
 import { DRIZZLE_DATABASE, type PostgresJsDatabase } from '@lark-apaas/fullstack-nestjs-core';
-import { appointments, patients, departments, doctors, timeSlots } from '@server/database/schema';
+import {
+  appointments,
+  patients,
+  departments,
+  doctors,
+  timeSlots,
+  familyBindings,
+  familyNotifications,
+} from '@server/database/schema';
 import { eq, and, desc, gte } from 'drizzle-orm';
 import type { Appointment, AppointmentStatus } from '@shared/api.interface';
 import { CreateAppointmentDto } from './dto/create-appointment.dto';
@@ -146,6 +154,7 @@ export class AppointmentsService {
             doctorId: timeSlots.doctorId,
             departmentId: timeSlots.departmentId,
             slotDate: timeSlots.slotDate,
+            slotPeriod: timeSlots.slotPeriod,
             slotTime: timeSlots.slotTime,
             remainingQuota: timeSlots.remainingQuota,
             fee: timeSlots.fee,
@@ -178,7 +187,7 @@ export class AppointmentsService {
           throw new ConflictException('号源不足，挂号失败');
         }
 
-        // 3. 创建挂号记录
+        // 3. 创建挂号记录（就诊时间合并时段，如"上午 08:30"）
         const inserted = await tx
           .insert(appointments)
           .values({
@@ -188,7 +197,7 @@ export class AppointmentsService {
             doctorId: dto.doctorId ?? slot.doctorId,
             timeSlotId: dto.timeSlotId,
             appointmentDate: slot.slotDate,
-            appointmentTime: slot.slotTime,
+            appointmentTime: `${slot.slotPeriod} ${slot.slotTime}`,
             status: 'confirmed',
             fee: slot.fee,
             isVoiceRegistration: dto.isVoiceRegistration ?? true,
@@ -221,19 +230,50 @@ export class AppointmentsService {
             createdAt: appointments.createdAt,
           })
           .from(appointments)
-          .innerJoin(patients, eq(appointments.patientId, patients.id))
-          .innerJoin(departments, eq(appointments.departmentId, departments.id))
+          .leftJoin(patients, eq(appointments.patientId, patients.id))
+          .leftJoin(departments, eq(appointments.departmentId, departments.id))
           .leftJoin(doctors, eq(appointments.doctorId, doctors.id))
           .where(eq(appointments.id, appointmentId));
 
         const row = detailResults[0];
+
+        // 5. 挂号成功 → 通知所有绑定该老人的子女端（失败不影响挂号本身）
+        try {
+          const bindings = await tx
+            .select({ familyUserId: familyBindings.familyUserId })
+            .from(familyBindings)
+            .where(
+              and(
+                eq(familyBindings.elderUserId, dto.userId),
+                eq(familyBindings.isActive, true),
+              ),
+            );
+          if (bindings.length > 0) {
+            const elderName = row.patientName ?? '家人';
+            const content = `${elderName}挂号成功：${row.departmentName ?? ''} ${String(row.appointmentDate)} ${row.appointmentTime ?? ''}${row.doctorName ? `，医生 ${row.doctorName}` : ''}`;
+            await tx.insert(familyNotifications).values(
+              bindings.map((b) => ({
+                familyUserId: b.familyUserId,
+                elderUserId: dto.userId,
+                elderName,
+                notificationType: 'registration_success',
+                content,
+                isRead: false,
+                appointmentId,
+              })),
+            );
+          }
+        } catch (notifyError) {
+          this.logger.warn('挂号成功通知发送失败（不影响挂号）', notifyError);
+        }
+
         return {
           id: row.id,
           userId: row.userId,
           patientId: row.patientId,
-          patientName: row.patientName,
+          patientName: row.patientName ?? '就诊人',
           departmentId: row.departmentId,
-          departmentName: row.departmentName,
+          departmentName: row.departmentName ?? '',
           doctorId: row.doctorId ?? null,
           doctorName: row.doctorName ?? null,
           timeSlotId: row.timeSlotId ?? null,

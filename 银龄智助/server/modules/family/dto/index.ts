@@ -1,8 +1,9 @@
-import { IsString, IsOptional, IsUUID } from 'class-validator';
+import { IsString, IsOptional } from 'class-validator';
 import type { CreateFamilyBindingRequest } from '@shared/api.interface';
 
 export class CreateFamilyBindingDto implements CreateFamilyBindingRequest {
-  @IsUUID()
+  // 本地/演示模式下 userId 为前端生成的非 UUID 字符串，放宽为 IsString
+  @IsString()
   familyUserId!: string;
 
   @IsString()
@@ -15,12 +16,27 @@ export class CreateFamilyBindingDto implements CreateFamilyBindingRequest {
   relationship!: string;
 }
 
+export class UpdateFamilyBindingDto {
+  @IsOptional()
+  @IsString()
+  elderName?: string;
+
+  @IsOptional()
+  @IsString()
+  elderPhone?: string;
+
+  @IsOptional()
+  @IsString()
+  relationship?: string;
+}
+
 export class CreateNotificationDto {
-  @IsUUID()
+  // 本地/演示模式下 userId 为前端生成的非 UUID 字符串，放宽为 IsString
+  @IsString()
   familyUserId!: string;
 
   @IsOptional()
-  @IsUUID()
+  @IsString()
   elderUserId?: string;
 
   @IsOptional()
@@ -34,6 +50,6 @@ export class CreateNotificationDto {
   content!: string;
 
   @IsOptional()
-  @IsUUID()
+  @IsString()
   appointmentId?: string;
 }

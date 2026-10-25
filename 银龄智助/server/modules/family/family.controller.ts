@@ -10,7 +10,11 @@ import {
   BadRequestException,
 } from '@nestjs/common';
 import { FamilyService } from './family.service';
-import { CreateFamilyBindingDto, CreateNotificationDto } from './dto';
+import {
+  CreateFamilyBindingDto,
+  CreateNotificationDto,
+  UpdateFamilyBindingDto,
+} from './dto';
 import type {
   FamilyBinding,
   FamilyNotification,
@@ -31,11 +35,37 @@ export class FamilyController {
     return this.familyService.listBindings(familyUserId);
   }
 
+  @Get('members')
+  async listMembers(
+    @Query('familyUserId') familyUserId: string,
+  ): Promise<{
+    items: Array<{
+      id: string;
+      name: string;
+      relation: string;
+      phone: string;
+      idCard: string;
+    }>;
+  }> {
+    if (!familyUserId) {
+      throw new BadRequestException('familyUserId 不能为空');
+    }
+    return this.familyService.listMembers(familyUserId);
+  }
+
   @Post('bind')
   async createBinding(
     @Body() dto: CreateFamilyBindingDto,
   ): Promise<FamilyBinding> {
     return this.familyService.createBinding(dto);
+  }
+
+  @Patch('bind/:id')
+  async updateBinding(
+    @Param('id') id: string,
+    @Body() dto: UpdateFamilyBindingDto,
+  ): Promise<FamilyBinding> {
+    return this.familyService.updateBinding(id, dto);
   }
 
   @Delete('bind/:id')
@@ -44,7 +74,7 @@ export class FamilyController {
     return { success: true };
   }
 
-  @Get('not')
+  @Get('notifications')
   async listNotifications(
     @Query('familyUserId') familyUserId: string,
   ): Promise<{ items: FamilyNotification[] }> {

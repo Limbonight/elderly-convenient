@@ -88,6 +88,7 @@ export class DepartmentsService {
           remainingQuota: timeSlots.remainingQuota,
           fee: timeSlots.fee,
           doctorName: doctors.name,
+          doctorTitle: doctors.title,
           departmentName: departments.name,
         })
         .from(timeSlots)
@@ -106,6 +107,9 @@ export class DepartmentsService {
         totalQuota: row.totalQuota,
         remainingQuota: row.remainingQuota,
         fee: String(row.fee),
+        doctorName: row.doctorName,
+        doctorTitle: row.doctorTitle,
+        departmentName: row.departmentName,
       }));
       return { items };
     } catch (error) {
@@ -137,6 +141,7 @@ export class DepartmentsService {
           remainingQuota: timeSlots.remainingQuota,
           fee: timeSlots.fee,
           doctorName: doctors.name,
+          doctorTitle: doctors.title,
           departmentName: departments.name,
         })
         .from(timeSlots)

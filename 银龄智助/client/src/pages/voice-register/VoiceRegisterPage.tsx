@@ -2,8 +2,20 @@ import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { logger } from '@lark-apaas/client-toolkit/logger';
 import { useSpeech } from '@client/src/hooks/useSpeech';
-import { voiceApi, appointmentsApi, timeSlotsApi, patientsApi, analyticsApi } from '@client/src/api';
+import { voiceApi, appointmentsApi, timeSlotsApi, patientsApi, analyticsApi, departmentsApi } from '@client/src/api';
+import type { Department } from '@client/src/api/departments';
 import { Badge } from '@client/src/components/ui/badge';
+
+interface SpeechRecognitionLike {
+  lang: string;
+  interimResults: boolean;
+  maxAlternatives: number;
+  onresult: ((event: { results: { 0: { 0: { transcript: string } } } }) => void) | null;
+  onerror: ((event: { error: string }) => void) | null;
+  onend: (() => void) | null;
+  start: () => void;
+  stop: () => void;
+}
 
 interface TimeSlot {
   id: string;
@@ -45,21 +57,42 @@ interface RegistrationData {
 const stepNames = ['唤醒', '输入', '时间', '就诊人', '确认'];
 const MAX_RETRIES = 3;
 
+// 本地兜底科室（接口不可用时使用）
+const FALLBACK_DEPARTMENTS: Department[] = [
+  { id: 'dept_neike', name: '内科', description: '常见内科疾病诊疗' },
+  { id: 'dept_waike', name: '外科', description: '普通外科疾病诊疗' },
+  { id: 'dept_guke', name: '骨科', description: '骨关节疾病诊疗' },
+  { id: 'dept_yanke', name: '眼科', description: '眼部疾病诊疗' },
+  { id: 'dept_erbihou', name: '耳鼻喉科', description: '耳鼻喉疾病诊疗' },
+  { id: 'dept_kouqiang', name: '口腔科', description: '口腔疾病诊疗' },
+];
+
+// 科室口语别名，提高语音识别匹配率
+const DEPARTMENT_ALIASES: Record<string, string[]> = {
+  '内科': ['心内科', '呼吸内科', '消化内科', '神经内科', '内分泌'],
+  '外科': ['普外科', '心外科', '胸外科', '神经外科'],
+  '骨科': ['骨头', '关节', '腰腿疼', '颈椎'],
+  '眼科': ['眼睛', '看不清', '视力', '白内障'],
+  '耳鼻喉科': ['耳朵', '鼻子', '喉咙', '嗓子', '耳鸣', '耳鼻喉'],
+  '口腔科': ['牙', '牙齿', '嘴巴', '口腔'],
+};
+
 function generateSessionId(): string {
   return 'voice_' + Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
 }
 
 function getDemoUserId(): string {
+  // 演示模式使用固定用户 ID，与数据库种子数据（就诊人等）保持一致
   try {
-    let id = localStorage.getItem('demoUserId');
-    if (!id) {
-      id = 'demo_' + Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
-      localStorage.setItem('demoUserId', id);
-    }
-    return id;
+    localStorage.setItem('demoUserId', 'demo_elder_001');
   } catch {
-    return 'demo_unknown';
+    // 忽略隐私模式下的存储错误
   }
+  return 'demo_elder_001';
+}
+
+function cleanVoiceText(text: string): string {
+  return text.replace(/[，。！？、,.!?~～\s]/g, '').trim();
 }
 
 const VoiceRegisterPage: React.FC = () => {
@@ -74,7 +107,9 @@ const VoiceRegisterPage: React.FC = () => {
   const [fraudTriggerWord, setFraudTriggerWord] = useState<string>('');
   const [registrationSuccess, setRegistrationSuccess] = useState<boolean>(false);
   const [sessionId] = useState<string>(() => generateSessionId());
-  const userIdRef = useRef<string>(getDemoUserId());
+
+  // 科室列表
+  const [departments, setDepartments] = useState<Department[]>([]);
 
   // 挂号数据
   const [regData, setRegData] = useState<RegistrationData>({
@@ -96,8 +131,87 @@ const VoiceRegisterPage: React.FC = () => {
   const [selectedPatientIndex, setSelectedPatientIndex] = useState<number>(-1);
   const [loadingSlots, setLoadingSlots] = useState<boolean>(false);
   const [recognizeFailed, setRecognizeFailed] = useState<boolean>(false);
+  const [submitting, setSubmitting] = useState<boolean>(false);
+  const [submitError, setSubmitError] = useState<string>('');
 
   const startTimeRef = useRef<number>(Date.now());
+
+  // 加载科室列表（接口失败用兜底数据）
+  useEffect(() => {
+    const loadDepartments = async (): Promise<void> => {
+      try {
+        const list = await departmentsApi.getDepartments();
+        if (list.length > 0) {
+          setDepartments(list);
+        } else {
+          setDepartments(FALLBACK_DEPARTMENTS);
+        }
+      } catch (error) {
+        logger.warn('科室接口不可用，使用内置科室', error);
+        setDepartments(FALLBACK_DEPARTMENTS);
+      }
+    };
+    void loadDepartments();
+  }, []);
+
+  /**
+   * 将识别文本匹配到真实科室：
+   * 1. 去掉标点后包含科室名即命中（如"我要挂骨科"命中"骨科"）
+   * 2. 未命中时尝试口语别名（如"牙疼"命中"口腔科"）
+   */
+  const matchDepartment = useCallback(
+    (text: string): Department | null => {
+      const cleanText = cleanVoiceText(text);
+      if (!cleanText || departments.length === 0) return null;
+
+      // 精确 / 包含匹配（名称长的优先，避免"口腔科"被"内科"误匹配）
+      const sorted = [...departments].sort(
+        (a: Department, b: Department) => b.name.length - a.name.length
+      );
+      for (const dept of sorted) {
+        if (cleanText.includes(dept.name)) return dept;
+      }
+
+      // 别名匹配
+      for (const dept of sorted) {
+        const aliases = DEPARTMENT_ALIASES[dept.name] ?? [];
+        for (const alias of aliases) {
+          if (cleanText.includes(alias)) return dept;
+        }
+      }
+      return null;
+    },
+    [departments]
+  );
+
+  /**
+   * 手动修改识别文本：同步更新匹配的科室
+   */
+  const handleEditText = (text: string): void => {
+    setRecognizedText(text);
+    const matched = matchDepartment(text);
+    setRegData((prev) => ({
+      ...prev,
+      departmentName: matched ? matched.name : cleanVoiceText(text),
+      departmentId: matched ? matched.id : '',
+    }));
+  };
+
+  /**
+   * 点击科室按钮直接选择
+   */
+  const handlePickDepartment = (dept: Department): void => {
+    setRecognizedText(dept.name);
+    setRegData((prev) => ({
+      ...prev,
+      departmentName: dept.name,
+      departmentId: dept.id,
+    }));
+    analyticsApi.trackEvent('voice_department_manually_selected', {
+      department: dept.name,
+      sessionId,
+    });
+  };
 
   // 语音指令检测
   const checkVoiceCommands = useCallback(
@@ -129,7 +243,7 @@ const VoiceRegisterPage: React.FC = () => {
           text,
           sessionId,
           stepNumber: currentStep,
-          userId: userIdRef.current,
+          userId: getDemoUserId(),
         });
         if (result.isFraud) {
           setFraudTriggerWord(result.triggerWord ?? '');
@@ -152,32 +266,40 @@ const VoiceRegisterPage: React.FC = () => {
     [sessionId, currentStep, speak, stopSpeaking]
   );
 
+  // 识别成功后统一处理：匹配科室 → 进入确认步骤
+  const handleRecognizedDepartment = useCallback(
+    async (text: string): Promise<void> => {
+      const isCommand = checkVoiceCommands(text);
+      if (isCommand) return;
+
+      const isFraud = await checkFraud(text);
+      if (isFraud) return;
+
+      const matched = matchDepartment(text);
+      setRecognizedText(text);
+      setRegData((prev) => ({
+        ...prev,
+        departmentName: matched ? matched.name : cleanVoiceText(text),
+        departmentId: matched ? matched.id : '',
+      }));
+      setRetryCount(0);
+      setCurrentStep(2);
+      if (matched) {
+        speak(`您说的是${text}，已为您匹配${matched.name}。可以点击屏幕上的科室按钮更换，或直接确认。`);
+      } else {
+        speak('没有自动识别出科室，请在下方科室列表中点击选择。');
+      }
+    },
+    [checkVoiceCommands, checkFraud, matchDepartment, speak]
+  );
+
   // 步骤1：唤醒语音
   const startStep1Listening = useCallback((): void => {
     speak('请说出您要挂的科室', {
       onEnd: () => {
         startRecognition(
           async (text: string) => {
-            setRecognizedText(text);
-            const isCommand = checkVoiceCommands(text);
-            if (isCommand) return;
-
-            const isFraud = await checkFraud(text);
-            if (isFraud) return;
-
-            // 简单模拟：去掉标点作为科室名
-            const cleanText = text.replace(/[，。！？、]/g, '').trim();
-            if (cleanText.length > 0) {
-              setRegData((prev) => ({
-                ...prev,
-                departmentName: cleanText,
-                departmentId: 'dept_' + cleanText,
-              }));
-              setRetryCount(0);
-              setCurrentStep(2);
-            } else {
-              handleRecognitionError('empty');
-            }
+            await handleRecognizedDepartment(text);
           },
           (error: string) => {
             handleRecognitionError(error);
@@ -185,7 +307,8 @@ const VoiceRegisterPage: React.FC = () => {
         );
       },
     });
-  }, [speak, startRecognition, checkVoiceCommands, checkFraud]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [speak, startRecognition, handleRecognizedDepartment]);
 
   // 识别错误处理
   const handleRecognitionError = (error: string): void => {
@@ -195,7 +318,7 @@ const VoiceRegisterPage: React.FC = () => {
 
     if (newRetryCount >= MAX_RETRIES) {
       setRecognizeFailed(true);
-      speak('识别失败，请按电话求助按钮联系工作人员。');
+      speak('识别失败，您可以直接在下方输入框手动输入，或按电话求助按钮联系工作人员。');
       analyticsApi.trackEvent('voice_recognition_failed_max_retries', {
         step: currentStep,
         sessionId,
@@ -205,15 +328,17 @@ const VoiceRegisterPage: React.FC = () => {
     }
   };
 
-  // 步骤2：语音输入确认
+  // 步骤2：确认科室（进入步骤3加载真实号源）
   const handleConfirmText = (): void => {
     stopSpeaking();
-    speak(`好的，${regData.departmentName}，正在为您查询号源`, {
-      onEnd: () => {
-        loadTimeSlots();
-        setCurrentStep(3);
-      },
-    });
+    if (!regData.departmentId) {
+      speak('还没有确定科室，请点击下方科室按钮选择一个科室。');
+      return;
+    }
+    // 先跳转再播报：不依赖 TTS 回调，避免语音合成不可用时页面卡住
+    speak(`好的，${regData.departmentName}，正在为您查询号源`);
+    void loadTimeSlots();
+    setCurrentStep(3);
     analyticsApi.trackEvent('voice_step2_confirmed', {
       department: regData.departmentName,
       sessionId,
@@ -227,30 +352,29 @@ const VoiceRegisterPage: React.FC = () => {
 
     if (newRetryCount >= MAX_RETRIES) {
       setRecognizeFailed(true);
-      speak('识别失败，请按电话求助按钮联系工作人员。');
+      speak('识别失败，您可以直接在下方输入框手动输入，或按电话求助按钮联系工作人员。');
       return;
     }
 
     setRecognizedText('');
+    setRegData((prev) => ({ ...prev, departmentName: '', departmentId: '' }));
     speak(`好的，请再说一遍您要挂的科室。还可以重试${MAX_RETRIES - newRetryCount}次`, {
       onEnd: () => {
         startRecognition(
           async (text: string) => {
-            setRecognizedText(text);
             const isCommand = checkVoiceCommands(text);
             if (isCommand) return;
 
             const isFraud = await checkFraud(text);
             if (isFraud) return;
 
-            const cleanText = text.replace(/[，。！？、]/g, '').trim();
-            if (cleanText.length > 0) {
-              setRegData((prev) => ({
-                ...prev,
-                departmentName: cleanText,
-                departmentId: 'dept_' + cleanText,
-              }));
-            }
+            const matched = matchDepartment(text);
+            setRecognizedText(text);
+            setRegData((prev) => ({
+              ...prev,
+              departmentName: matched ? matched.name : cleanVoiceText(text),
+              departmentId: matched ? matched.id : '',
+            }));
           },
           (error: string) => {
             handleRecognitionError(error);
@@ -260,7 +384,7 @@ const VoiceRegisterPage: React.FC = () => {
     });
   };
 
-  // 步骤3：加载号源
+  // 步骤3：加载号源（真实接口 + 演示兜底）
   const loadTimeSlots = async (): Promise<void> => {
     setLoadingSlots(true);
     try {
@@ -278,7 +402,7 @@ const VoiceRegisterPage: React.FC = () => {
           .join('。');
         speak(`为您找到${slots.length}个号源。${slotText}。请选择第几个。`);
       } else {
-        speak('暂无可用号源，请选择其他科室。');
+        speak('该科室暂无可用号源，请返回选择其他科室。');
       }
     } catch (error) {
       logger.error('加载号源失败', error);
@@ -441,18 +565,29 @@ const VoiceRegisterPage: React.FC = () => {
   // 步骤5：确认挂号
   const handleConfirmRegistration = async (): Promise<void> => {
     stopSpeaking();
+    setSubmitting(true);
+    setSubmitError('');
     try {
       const duration = Math.floor((Date.now() - startTimeRef.current) / 1000);
-      await appointmentsApi.createAppointment({
+      const created = await appointmentsApi.createAppointment({
+        userId: getDemoUserId(),
         patientId: regData.patientId,
-        patientName: regData.patientName,
-        department: regData.departmentName,
-        doctor: regData.doctorName,
-        date: regData.appointmentDate,
-        timeSlot: regData.appointmentTime,
-        status: 'confirmed',
-        hospital: '市第一人民医院',
+        departmentId: regData.departmentId,
+        doctorId: regData.doctorId || undefined,
+        timeSlotId: regData.timeSlotId,
+        isVoiceRegistration: true,
+        totalDurationSeconds: duration,
+        source: 'elder',
       });
+      // 用服务端返回的完整数据刷新确认信息
+      setRegData((prev) => ({
+        ...prev,
+        doctorName: created.doctor || prev.doctorName,
+        appointmentDate: created.date || prev.appointmentDate,
+        appointmentTime: created.timeSlot || prev.appointmentTime,
+        patientName: created.patientName || prev.patientName,
+        fee: created.fee || prev.fee,
+      }));
       setRegistrationSuccess(true);
       speak('挂号成功！请按时就诊。安全提醒：谨防任何要求转账的电话。');
       analyticsApi.trackEvent('voice_registration_success', {
@@ -462,7 +597,10 @@ const VoiceRegisterPage: React.FC = () => {
       });
     } catch (error) {
       logger.error('挂号失败', error);
-      speak('挂号失败，请稍后重试或联系客服。');
+      setSubmitError('挂号失败，请再试一次。若多次失败，请点击"电话求助"联系工作人员。');
+      speak('挂号失败，请再试一次。');
+    } finally {
+      setSubmitting(false);
     }
   };
 
@@ -493,7 +631,7 @@ const VoiceRegisterPage: React.FC = () => {
         speak('请说出您要挂的科室');
         break;
       case 2:
-        speak(`您说的是${recognizedText}，对吗？对的话请说对，不对请说重说`);
+        speak(`您说的是${recognizedText}。可以点击下方文字修改，或点击科室按钮重新选择。确认无误请点绿色按钮。`);
         break;
       case 3:
         if (timeSlots.length > 0) {
@@ -526,6 +664,263 @@ const VoiceRegisterPage: React.FC = () => {
     setShowFraudWarning(false);
     stopSpeaking();
   };
+
+  // ==================== 全程语音助手 ====================
+  const [assistantListening, setAssistantListening] = useState<boolean>(false);
+  const assistantRef = useRef<{ stop: () => void } | null>(null);
+
+  // 各步骤操作指引
+  const ASSISTANT_HINTS: Record<number, string> = {
+    1: '您可以说"我要挂骨科"这样的指令，或点击屏幕上的科室按钮。',
+    2: '您可以说其他科室名称来更换，说"确认"进入下一步，说"返回"回到上一步。',
+    3: '您可以说"第一个""第二个"选择号源，也可以说医生名字或"上午""下午"。选好后说"确认"。',
+    4: '您可以说"第一个"或就诊人姓名来选择，选好后说"确认"。',
+    5: '您可以说"确认挂号"完成挂号，或说"返回"重新选择。',
+  };
+
+  /** 解析口语序号："第一个/第2个/2号" → 下标 */
+  const parseAssistantIndex = (text: string): number => {
+    const cnMap: Record<string, number> = { 一: 0, 二: 1, 两: 1, 三: 2, 四: 3, 五: 4, 六: 5, 七: 6, 八: 7, 九: 8, 十: 9 };
+    const m1 = text.match(/第\s*([0-9１-９]+)\s*[个号条]/);
+    if (m1) return parseInt(m1[1], 10) - 1;
+    const m2 = text.match(/第\s*([一二两三四五六七八九十])\s*[个号条]/);
+    if (m2) return cnMap[m2[1]] ?? -1;
+    const m3 = text.match(/^([0-9１-９])\s*[号个]$/);
+    if (m3) return parseInt(m3[1], 10) - 1;
+    const m4 = text.match(/^([一二两三四五六七八九十])[号个]$/);
+    if (m4) return cnMap[m4[1]] ?? -1;
+    return -1;
+  };
+
+  /** 执行语音助手指令：按当前步骤分发 */
+  const runAssistantCommand = (text: string): void => {
+    const clean = cleanVoiceText(text);
+    logger.info('语音助手收到指令', { step: currentStep, command: clean });
+    analyticsApi.trackEvent('voice_assistant_command', {
+      step: currentStep,
+      command: clean.slice(0, 30),
+      sessionId,
+    });
+    if (!clean) {
+      speak('没有听清，请再按一次语音助手按钮。');
+      return;
+    }
+
+    // 全局指令：帮助
+    if (/(帮助|怎么办|怎么弄|怎么操作|如何操作|指引|提示|干什么)/.test(clean)) {
+      speak(ASSISTANT_HINTS[currentStep] ?? '请按屏幕提示操作。');
+      return;
+    }
+    // 全局指令：返回上一步
+    if (/(返回|上一步|回去|退回|重新选)/.test(clean)) {
+      if (currentStep > 1) {
+        setCurrentStep(currentStep - 1);
+        speak('好的，已返回上一步。');
+      } else {
+        speak('这已经是第一步了。您可以直接说"我要挂某科室"。');
+      }
+      return;
+    }
+    // 全局指令：取消挂号
+    if (/(不挂了|取消挂号|退出挂号)/.test(clean)) {
+      handleCancel();
+      return;
+    }
+
+    switch (currentStep) {
+      // 步骤1：说科室 → 复用识别处理（自动匹配科室并进入步骤2）
+      case 1: {
+        const matched = matchDepartment(clean);
+        if (matched) {
+          void handleRecognizedDepartment(clean);
+        } else if (clean.length >= 2) {
+          void handleRecognizedDepartment(clean);
+        } else {
+          speak('请说出您要挂的科室，例如"我要挂骨科"。');
+        }
+        return;
+      }
+      // 步骤2：换科室 / 确认
+      case 2: {
+        const confirmMatch = /(确认|确定|提交|就这样|可以了?|对的?|好的?|挂这个)/.test(clean);
+        if (confirmMatch) {
+          handleConfirmText();
+          return;
+        }
+        const dept = matchDepartment(clean);
+        if (dept) {
+          handlePickDepartment(dept);
+          speak(
+            dept.id === regData.departmentId
+              ? `${dept.name}已经是当前选择的科室，说"确认"进入下一步。`
+              : `已为您选择${dept.name}，说"确认"进入下一步。`
+          );
+          return;
+        }
+        speak('没听懂。您可以说科室名称来更换，或说"确认"进入下一步。');
+        return;
+      }
+      // 步骤3：选号源（序号/时段/医生名）→ 确认
+      case 3: {
+        if (/(确认|确定|提交|就这样|可以了?|对的?|好的?|就这个)/.test(clean)) {
+          if (selectedSlotIndex >= 0) {
+            handleConfirmSlot();
+          } else {
+            speak('请先选择一个号源，可以说"第一个"。');
+          }
+          return;
+        }
+        const idx = parseAssistantIndex(clean);
+        if (idx >= 0) {
+          if (idx < timeSlots.length) {
+            handleSelectSlot(idx);
+            speak(`已选择${timeSlots[idx].slotPeriod}${timeSlots[idx].slotTime}的号源，说"确认"进入下一步。`);
+          } else {
+            speak(`一共只有${timeSlots.length}个号源，请重新选择。`);
+          }
+          return;
+        }
+        if (/上午|早上|中午/.test(clean) || /下午|晚上/.test(clean)) {
+          const wantPm = /下午|晚上/.test(clean);
+          const found = timeSlots.findIndex((s) =>
+            wantPm ? s.slotPeriod.includes('下午') : s.slotPeriod.includes('上午')
+          );
+          if (found >= 0) {
+            handleSelectSlot(found);
+            speak(`已选择${timeSlots[found].slotPeriod}${timeSlots[found].slotTime}的号源，说"确认"进入下一步。`);
+            return;
+          }
+          speak(wantPm ? '这个科室没有下午的号源。' : '这个科室没有上午的号源。');
+          return;
+        }
+        const byDoctor = timeSlots.findIndex((s) => {
+          if (!s.doctorName) return false;
+          const bare = s.doctorName.replace(/医生|大夫/g, '');
+          return clean.includes(bare) || clean.includes(s.doctorName);
+        });
+        if (byDoctor >= 0) {
+          handleSelectSlot(byDoctor);
+          speak(
+            `已选择${timeSlots[byDoctor].doctorName ?? ''}医生${timeSlots[byDoctor].slotPeriod}${timeSlots[byDoctor].slotTime}的号源，说"确认"进入下一步。`
+          );
+          return;
+        }
+        speak('没听懂。可以说"第一个"，或医生名字，或"上午""下午"。');
+        return;
+      }
+      // 步骤4：选就诊人（序号/姓名）→ 确认
+      case 4: {
+        if (/(确认|确定|提交|就这样|可以了?|对的?|好的?|就这个)/.test(clean)) {
+          if (selectedPatientIndex >= 0) {
+            handleConfirmPatient();
+          } else {
+            speak('请先选择就诊人，可以说"第一个"。');
+          }
+          return;
+        }
+        const idx = parseAssistantIndex(clean);
+        if (idx >= 0) {
+          if (idx < patients.length) {
+            handleSelectPatient(idx);
+            speak(`已选择${patients[idx].name}，说"确认"进入下一步。`);
+          } else {
+            speak(`一共只有${patients.length}位就诊人，请重新选择。`);
+          }
+          return;
+        }
+        const byName = patients.findIndex((p) => {
+          const bare = p.name.replace(/大爷|奶奶|阿姨|叔叔|爷爷/g, '');
+          return clean.includes(p.name) || (bare.length >= 2 && clean.includes(bare));
+        });
+        if (byName >= 0) {
+          handleSelectPatient(byName);
+          speak(`已选择${patients[byName].name}，说"确认"进入下一步。`);
+          return;
+        }
+        speak('没听懂。可以说"第一个"或就诊人姓名。');
+        return;
+      }
+      // 步骤5：确认挂号
+      case 5: {
+        if (/(确认|确定|挂号|提交|可以了?|对的?|好的?|就这样|挂吧)/.test(clean)) {
+          void handleConfirmRegistration();
+          return;
+        }
+        speak('说"确认挂号"完成挂号，或说"返回"重新选择。');
+        return;
+      }
+      default:
+        speak('请按屏幕提示操作。');
+    }
+  };
+
+  /** 呼出语音助手：单次监听一句指令 */
+  const startAssistant = (): void => {
+    stopSpeaking();
+    stopRecognition();
+    const SR =
+      (window as unknown as { SpeechRecognition?: new () => SpeechRecognitionLike; webkitSpeechRecognition?: new () => SpeechRecognitionLike })
+        .SpeechRecognition ??
+      (window as unknown as { webkitSpeechRecognition?: new () => SpeechRecognitionLike }).webkitSpeechRecognition;
+    if (!SR) {
+      speak('当前浏览器不支持语音识别，请按屏幕按钮手动操作。');
+      return;
+    }
+    try {
+      const rec = new SR();
+      rec.lang = 'zh-CN';
+      rec.interimResults = false;
+      rec.maxAlternatives = 1;
+      rec.onresult = (event: { results: { 0: { 0: { transcript: string } } } }) => {
+        const text = event.results?.[0]?.[0]?.transcript ?? '';
+        if (text) runAssistantCommand(text);
+      };
+      rec.onerror = (event: { error: string }) => {
+        setAssistantListening(false);
+        if (event.error !== 'aborted' && event.error !== 'no-speech') {
+          speak('没有听清，请再按一次语音助手按钮。');
+        }
+      };
+      rec.onend = () => setAssistantListening(false);
+      assistantRef.current = rec;
+      setAssistantListening(true);
+      rec.start();
+      speak('语音助手在听，请说指令。');
+    } catch (error) {
+      logger.warn('语音助手启动失败', error);
+      setAssistantListening(false);
+      speak('语音助手启动失败，请按屏幕按钮手动操作。');
+    }
+  };
+
+  const stopAssistant = (): void => {
+    try {
+      assistantRef.current?.stop();
+    } catch {
+      // 忽略停止异常
+    }
+    setAssistantListening(false);
+  };
+
+  /** 全程悬浮的语音助手按钮 */
+  const renderAssistantButton = (): React.ReactNode => (
+    <button
+      onClick={assistantListening ? stopAssistant : startAssistant}
+      aria-label="语音助手"
+      className={`fixed bottom-6 right-6 z-50 h-20 w-20 rounded-full text-white shadow-2xl flex flex-col items-center justify-center border-4 border-white transition-all ${
+        assistantListening
+          ? 'bg-[#D93025] animate-pulse scale-110'
+          : 'bg-[#E8710A] hover:bg-[#D95F02] active:scale-95'
+      }`}
+    >
+      <svg viewBox="0 0 24 24" fill="currentColor" className="w-7 h-7">
+        <path d="M12 14a3 3 0 0 0 3-3V5a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-3.08A7 7 0 0 0 19 11h-2z" />
+      </svg>
+      <span className="text-[13px] font-bold leading-none mt-1">
+        {assistantListening ? '听中...' : '语音助手'}
+      </span>
+    </button>
+  );
 
   // 进入步骤时自动播报
   useEffect(() => {
@@ -654,7 +1049,7 @@ const VoiceRegisterPage: React.FC = () => {
       </div>
 
       {/* 主内容区 */}
-      <div className="flex-1 flex items-center justify-center px-6 py-6">
+      <div className="flex-1 flex items-start justify-center px-6 py-6">
         <div className="max-w-[600px] w-full">
           {/* 步骤1：唤醒语音 */}
           {currentStep === 1 && (
@@ -678,48 +1073,139 @@ const VoiceRegisterPage: React.FC = () => {
                 <p className="text-[28px] font-bold text-[#D93025]">正在聆听...</p>
               )}
               {!isListening && (
-                <button
-                  onClick={handleRepeatPrompt}
-                  className="text-[24px] font-bold text-[#1A73E8] underline"
-                >
-                  听不到？再说一遍
-                </button>
+                <>
+                  <button
+                    onClick={handleRepeatPrompt}
+                    className="text-[24px] font-bold text-[#1A73E8] underline"
+                  >
+                    听不到？再说一遍
+                  </button>
+                  <button
+                    onClick={() => {
+                      stopSpeaking();
+                      stopRecognition();
+                      setRecognizedText('');
+                      setRegData((prev) => ({
+                        ...prev,
+                        departmentName: '',
+                        departmentId: '',
+                      }));
+                      setCurrentStep(2);
+                    }}
+                    className="w-full h-20 bg-[#E37400] text-white text-[26px] font-bold rounded-xl hover:bg-[#c26200] active:bg-[#a05100] transition-colors"
+                  >
+                    ⌨️ 语音不好用？直接手动输入科室
+                  </button>
+                  {recognizeFailed && (
+                    <button
+                      onClick={() => navigate('/elder/help')}
+                      className="w-full h-20 bg-[#D93025] text-white text-[28px] font-bold rounded-xl hover:bg-red-700 active:bg-red-800 transition-colors"
+                    >
+                      📞 电话求助
+                    </button>
+                  )}
+                </>
+              )}
+              {recognizeFailed && (
+                <p className="text-[24px] font-bold text-[#D93025] text-center">
+                  语音识别多次失败，请点击上方按钮手动输入，或电话求助
+                </p>
               )}
             </div>
           )}
 
-          {/* 步骤2：语音输入确认 */}
+          {/* 步骤2：识别结果确认（可手动修改 + 科室选择） */}
           {currentStep === 2 && (
-            <div className="flex flex-col items-center gap-8">
-              <p className="text-[24px] text-gray-600">识别到您说的是：</p>
-              <p className="text-[40px] font-bold text-black text-center leading-relaxed">
-                {recognizedText || '...'}
-              </p>
-              <p className="text-[22px] text-gray-500">
-                还可以重试 {MAX_RETRIES - retryCount} 次
-              </p>
+            <div className="flex flex-col gap-6">
+              <h2 className="text-[32px] font-bold text-black text-center">
+                确认您要挂的科室
+              </h2>
+
+              {/* 可编辑的识别文本 */}
+              <div className="flex flex-col gap-2">
+                <label
+                  htmlFor="recognized-text-input"
+                  className="text-[24px] font-bold text-black"
+                >
+                  识别结果（可直接点击修改）：
+                </label>
+                <input
+                  id="recognized-text-input"
+                  type="text"
+                  value={recognizedText}
+                  onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
+                    handleEditText(e.target.value)
+                  }
+                  placeholder="识别结果为空时，可在此手动输入科室"
+                  className="w-full h-20 px-5 text-[32px] font-bold text-black bg-white border-3 border-[#1A73E8] rounded-xl focus:outline-none focus:ring-4 focus:ring-blue-200"
+                  aria-label="识别结果，可手动修改"
+                />
+                {regData.departmentId ? (
+                  <p className="text-[22px] font-bold text-[#137333]">
+                    ✓ 已匹配科室：{regData.departmentName}
+                  </p>
+                ) : (
+                  <p className="text-[22px] text-[#E37400] font-bold">
+                    未匹配到科室，请点击下方按钮选择
+                  </p>
+                )}
+              </div>
+
+              {/* 科室选择网格 */}
+              <div className="flex flex-col gap-3">
+                <p className="text-[24px] font-bold text-black">或直接点选科室：</p>
+                <div className="grid grid-cols-2 gap-3">
+                  {departments.map((dept: Department) => {
+                    const isSelected = dept.id === regData.departmentId;
+                    return (
+                      <button
+                        key={dept.id}
+                        onClick={() => handlePickDepartment(dept)}
+                        className={`h-20 rounded-xl border-3 text-[28px] font-bold transition-all active:scale-95 ${
+                          isSelected
+                            ? 'bg-[#1A73E8] text-white border-[#1A73E8] shadow-lg'
+                            : 'bg-white text-black border-black hover:border-[#1A73E8] hover:bg-blue-50'
+                        }`}
+                        aria-label={`选择${dept.name}`}
+                        aria-pressed={isSelected}
+                      >
+                        {isSelected ? '✓ ' : ''}
+                        {dept.name}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {recognizeFailed && (
+                <p className="text-[22px] text-[#D93025] font-bold text-center">
+                  语音识别多次失败，请直接在上方输入框手动输入或点选科室
+                </p>
+              )}
+
               <div className="w-full flex flex-col gap-4">
                 <button
                   onClick={handleConfirmText}
-                  className="w-full h-24 bg-[#137333] text-white text-[32px] font-bold rounded-xl hover:bg-green-700 active:bg-green-800 transition-colors"
+                  disabled={!regData.departmentId}
+                  className="w-full h-24 bg-[#137333] text-white text-[32px] font-bold rounded-xl hover:bg-green-700 active:bg-green-800 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                 >
-                  ✓ 对，就是这个
+                  ✓ 对，就挂{regData.departmentName || '这个科'}
                 </button>
                 <button
                   onClick={handleRejectText}
-                  className="w-full h-24 bg-[#E37400] text-white text-[32px] font-bold rounded-xl hover:bg-[#c26200] active:bg-[#a05100] transition-colors"
+                  className="w-full h-20 bg-[#E37400] text-white text-[28px] font-bold rounded-xl hover:bg-[#c26200] active:bg-[#a05100] transition-colors"
                 >
-                  ✗ 不对，重说
+                  🎤 不对，重新语音输入
                 </button>
+                {recognizeFailed && (
+                  <button
+                    onClick={() => navigate('/elder/help')}
+                    className="w-full h-20 bg-[#D93025] text-white text-[28px] font-bold rounded-xl hover:bg-red-700 active:bg-red-800 transition-colors"
+                  >
+                    📞 电话求助
+                  </button>
+                )}
               </div>
-              {recognizeFailed && (
-                <button
-                  onClick={() => navigate('/elder/help')}
-                  className="w-full h-20 bg-[#D93025] text-white text-[28px] font-bold rounded-xl hover:bg-red-700 active:bg-red-800 transition-colors"
-                >
-                  📞 识别失败，请电话求助
-                </button>
-              )}
             </div>
           )}
 
@@ -885,11 +1371,17 @@ const VoiceRegisterPage: React.FC = () => {
                 </div>
               </div>
               <div className="flex flex-col gap-4">
+                {submitError && (
+                  <p className="text-[24px] font-bold text-[#D93025] text-center bg-red-50 border-2 border-[#D93025] rounded-xl p-4">
+                    ⚠️ {submitError}
+                  </p>
+                )}
                 <button
                   onClick={handleConfirmRegistration}
-                  className="w-full h-24 bg-[#137333] text-white text-[32px] font-bold rounded-xl hover:bg-green-700 active:bg-green-800 transition-colors shadow-lg"
+                  disabled={submitting}
+                  className="w-full h-24 bg-[#137333] text-white text-[32px] font-bold rounded-xl hover:bg-green-700 active:bg-green-800 transition-colors shadow-lg disabled:opacity-60 disabled:cursor-wait"
                 >
-                  ✓ 确认挂号
+                  {submitting ? '正在提交挂号...' : '✓ 确认挂号'}
                 </button>
                 <button
                   onClick={handleGoBack}
@@ -952,6 +1444,9 @@ const VoiceRegisterPage: React.FC = () => {
           </div>
         </div>
       )}
+
+      {/* 全程悬浮语音助手 */}
+      {renderAssistantButton()}
     </div>
   );
 };

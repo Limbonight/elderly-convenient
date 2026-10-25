@@ -57,9 +57,19 @@ export function useSpeech(options: UseSpeechOptions = {}): UseSpeechReturn {
   const onResultRef = useRef<((text: string) => void) | null>(null);
   const onErrorRef = useRef<((error: string) => void) | null>(null);
   const utteranceRef = useRef<SpeechSynthesisUtterance | null>(null);
+  // 识别超时与结果标记：防止浏览器静默挂起导致用户卡死
+  const listenTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const gotResultRef = useRef<boolean>(false);
   const supportedRef = useRef<boolean>(
     getSpeechRecognitionCtor() !== null && hasSpeechSynthesis()
   );
+
+  const clearListenTimeout = useCallback((): void => {
+    if (listenTimeoutRef.current) {
+      clearTimeout(listenTimeoutRef.current);
+      listenTimeoutRef.current = null;
+    }
+  }, []);
 
   const ensureRecognition = useCallback((): SpeechRecognitionInstance | null => {
     if (recognitionRef.current) return recognitionRef.current;
@@ -74,17 +84,30 @@ export function useSpeech(options: UseSpeechOptions = {}): UseSpeechReturn {
     rec.onresult = (event: { results: { transcript: string }[][]; resultIndex: number }) => {
       const transcript = event.results[event.resultIndex][0]?.transcript ?? '';
       logger.debug('语音识别结果', { transcript });
+      gotResultRef.current = true;
+      clearListenTimeout();
       onResultRef.current?.(transcript);
     };
 
     rec.onerror = (event: { error: string }) => {
       logger.warn('语音识别错误', { error: event.error });
+      clearListenTimeout();
+      // 标记已处理，避免 onend 重复报错
+      if (!gotResultRef.current) {
+        gotResultRef.current = true;
+        onErrorRef.current?.(event.error);
+      }
       setIsListening(false);
-      onErrorRef.current?.(event.error);
     };
 
     rec.onend = () => {
+      clearListenTimeout();
       setIsListening(false);
+      // 识别结束但没有任何结果/错误（部分浏览器静默失败），按错误处理
+      if (!gotResultRef.current) {
+        gotResultRef.current = true;
+        onErrorRef.current?.('no-speech');
+      }
     };
 
     rec.onstart = () => {
@@ -93,7 +116,7 @@ export function useSpeech(options: UseSpeechOptions = {}): UseSpeechReturn {
 
     recognitionRef.current = rec;
     return rec;
-  }, [lang]);
+  }, [lang, clearListenTimeout]);
 
   const speak = useCallback(
     (text: string, opts?: { rate?: number; onEnd?: () => void }) => {
@@ -144,6 +167,21 @@ export function useSpeech(options: UseSpeechOptions = {}): UseSpeechReturn {
       }
       onResultRef.current = onResult;
       onErrorRef.current = onError ?? null;
+      gotResultRef.current = false;
+      // 超时保护：15 秒无结果按失败处理，避免静默挂起
+      clearListenTimeout();
+      listenTimeoutRef.current = setTimeout(() => {
+        if (!gotResultRef.current) {
+          gotResultRef.current = true;
+          try {
+            rec.abort();
+          } catch (error) {
+            logger.warn('超时中止识别失败', error);
+          }
+          setIsListening(false);
+          onErrorRef.current?.('timeout');
+        }
+      }, 15000);
       try {
         rec.start();
       } catch (error) {
@@ -163,10 +201,11 @@ export function useSpeech(options: UseSpeechOptions = {}): UseSpeechReturn {
         }
       }
     },
-    [ensureRecognition]
+    [ensureRecognition, clearListenTimeout]
   );
 
   const stopRecognition = useCallback(() => {
+    clearListenTimeout();
     if (recognitionRef.current) {
       try {
         recognitionRef.current.stop();
@@ -175,9 +214,10 @@ export function useSpeech(options: UseSpeechOptions = {}): UseSpeechReturn {
       }
     }
     setIsListening(false);
-  }, []);
+  }, [clearListenTimeout]);
 
   const abortRecognition = useCallback(() => {
+    clearListenTimeout();
     if (recognitionRef.current) {
       try {
         recognitionRef.current.abort();
@@ -186,7 +226,7 @@ export function useSpeech(options: UseSpeechOptions = {}): UseSpeechReturn {
       }
     }
     setIsListening(false);
-  }, []);
+  }, [clearListenTimeout]);
 
   useEffect(() => {
     return () => {
