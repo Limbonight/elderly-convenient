@@ -2,7 +2,8 @@ import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { logger } from '@lark-apaas/client-toolkit/logger';
 import { useSpeech } from '@client/src/hooks/useSpeech';
-import { voiceApi, appointmentsApi, timeSlotsApi, patientsApi, analyticsApi, departmentsApi } from '@client/src/api';
+import { voiceApi, appointmentsApi, timeSlotsApi, analyticsApi, departmentsApi } from '@client/src/api';
+import { getRegistrationPatients } from '@client/src/api/family';
 import type { Department } from '@client/src/api/departments';
 import { Badge } from '@client/src/components/ui/badge';
 
@@ -52,6 +53,31 @@ interface RegistrationData {
   patientId: string;
   patientName: string;
   fee: string;
+}
+
+/** 按 日期 → 上午/下午 分组号源，保证医生与时段清晰不重复 */
+function groupSlotsByDate(slots: TimeSlot[]): Array<{
+  date: string;
+  periods: Array<{ period: string; time: string; items: Array<{ slot: TimeSlot; index: number }> }>;
+}> {
+  const dates: string[] = [];
+  const byDate = new Map<string, Map<string, Array<{ slot: TimeSlot; index: number }>>>();
+  slots.forEach((slot, index) => {
+    if (!byDate.has(slot.slotDate)) {
+      byDate.set(slot.slotDate, new Map());
+      dates.push(slot.slotDate);
+    }
+    const periods = byDate.get(slot.slotDate)!;
+    if (!periods.has(slot.slotPeriod)) periods.set(slot.slotPeriod, []);
+    periods.get(slot.slotPeriod)!.push({ slot, index });
+  });
+  const periodOrder = (p: string): number => (p === '上午' ? 0 : 1);
+  return dates.map((date) => ({
+    date,
+    periods: [...byDate.get(date)!.entries()]
+      .sort((a, b) => periodOrder(a[0]) - periodOrder(b[0]))
+      .map(([period, items]) => ({ period, time: items[0]?.slot.slotTime ?? '', items })),
+  }));
 }
 
 const stepNames = ['唤醒', '输入', '时间', '就诊人', '确认'];
@@ -384,72 +410,37 @@ const VoiceRegisterPage: React.FC = () => {
     });
   };
 
-  // 步骤3：加载号源（真实接口 + 演示兜底）
+  // 步骤3：加载号源（真实接口，失败时提示重试，不再使用假号源）
   const loadTimeSlots = async (): Promise<void> => {
     setLoadingSlots(true);
+    setSelectedSlotIndex(-1);
     try {
       const slots = await timeSlotsApi.getTimeSlots({
         departmentId: regData.departmentId,
       });
       setTimeSlots(slots);
       if (slots.length > 0) {
-        const slotText = slots
-          .slice(0, 3)
-          .map(
-            (s: TimeSlot, i: number) =>
-              `第${i + 1}个，${s.slotDate}${s.slotPeriod}，${s.doctorName ?? ''}医生，剩余${s.remainingQuota}个号`
-          )
-          .join('。');
-        speak(`为您找到${slots.length}个号源。${slotText}。请选择第几个。`);
+        const firstDate = slots[0].slotDate;
+        const morning = slots
+          .filter((s: TimeSlot) => s.slotDate === firstDate && s.slotPeriod === '上午')
+          .map((s: TimeSlot) => s.doctorName)
+          .filter(Boolean)
+          .join('、');
+        const afternoon = slots
+          .filter((s: TimeSlot) => s.slotDate === firstDate && s.slotPeriod === '下午')
+          .map((s: TimeSlot) => s.doctorName)
+          .filter(Boolean)
+          .join('、');
+        speak(
+          `共${slots.length}个号源。${firstDate}上午有${morning}医生，下午有${afternoon}医生。请选择就诊时间和医生。`
+        );
       } else {
         speak('该科室暂无可用号源，请返回选择其他科室。');
       }
     } catch (error) {
       logger.error('加载号源失败', error);
-      // 演示数据兜底
-      const demoSlots: TimeSlot[] = [
-        {
-          id: 'slot1',
-          doctorId: 'doc1',
-          departmentId: regData.departmentId,
-          slotDate: '明天',
-          slotPeriod: '上午',
-          slotTime: '09:00',
-          totalQuota: 20,
-          remainingQuota: 5,
-          fee: '50元',
-          doctorName: '张医生',
-          doctorTitle: '主任医师',
-        },
-        {
-          id: 'slot2',
-          doctorId: 'doc2',
-          departmentId: regData.departmentId,
-          slotDate: '明天',
-          slotPeriod: '下午',
-          slotTime: '14:00',
-          totalQuota: 20,
-          remainingQuota: 8,
-          fee: '50元',
-          doctorName: '李医生',
-          doctorTitle: '副主任医师',
-        },
-        {
-          id: 'slot3',
-          doctorId: 'doc3',
-          departmentId: regData.departmentId,
-          slotDate: '后天',
-          slotPeriod: '上午',
-          slotTime: '10:00',
-          totalQuota: 20,
-          remainingQuota: 12,
-          fee: '50元',
-          doctorName: '王医生',
-          doctorTitle: '主治医师',
-        },
-      ];
-      setTimeSlots(demoSlots);
-      speak(`为您找到${demoSlots.length}个号源。第一个，明天上午，张医生，剩余5个号。第二个，明天下午，李医生，剩余8个号。第三个，后天上午，王医生，剩余12个号。请选择第几个。`);
+      setTimeSlots([]);
+      speak('号源加载失败，请点击重新查询，或返回选择其他科室。');
     } finally {
       setLoadingSlots(false);
     }
@@ -484,55 +475,34 @@ const VoiceRegisterPage: React.FC = () => {
     setCurrentStep(4);
   };
 
-  // 步骤4：加载就诊人
+  // 步骤4：加载就诊人（直接使用子女端维护的老人信息，不再显示本人/伴侣）
   const loadPatients = async (): Promise<void> => {
     try {
-      const data = await patientsApi.getPatients();
-      setPatients(data);
-      if (data.length > 0) {
-        const defaultIndex = data.findIndex((p: Patient) => p.isDefault);
-        if (defaultIndex >= 0) {
-          setSelectedPatientIndex(defaultIndex);
-          setRegData((prev) => ({
-            ...prev,
-            patientId: data[defaultIndex].id,
-            patientName: data[defaultIndex].name,
-          }));
-        }
-        const names = data.map((p: Patient) => p.name).join('、');
-        speak(`请选择就诊人。您的常用就诊人有：${names}`);
+      const items = await getRegistrationPatients(getDemoUserId());
+      const list: Patient[] = items.map((p) => ({
+        id: p.id,
+        name: p.name,
+        phone: p.phone,
+        idCard: '',
+      }));
+      setPatients(list);
+      if (list.length > 0) {
+        setSelectedPatientIndex(0);
+        setRegData((prev) => ({
+          ...prev,
+          patientId: list[0].id,
+          patientName: list[0].name,
+        }));
+        speak(`请选择就诊人，共${list.length}位：${list.map((p) => p.name).join('、')}。`);
       } else {
-        speak('还没有就诊人信息，请让子女帮您添加。');
+        setSelectedPatientIndex(-1);
+        speak('还没有子女端维护的老人信息，请让子女先在子女端添加。');
       }
     } catch (error) {
       logger.error('加载就诊人失败', error);
-      // 演示数据兜底
-      const demoPatients: Patient[] = [
-        {
-          id: 'pat1',
-          name: '王大爷',
-          idCard: '110101195001011234',
-          phone: '138****0001',
-          relation: '本人',
-          isDefault: true,
-        },
-        {
-          id: 'pat2',
-          name: '李奶奶',
-          idCard: '110101195202025678',
-          phone: '138****0002',
-          relation: '老伴',
-          isDefault: false,
-        },
-      ];
-      setPatients(demoPatients);
-      setSelectedPatientIndex(0);
-      setRegData((prev) => ({
-        ...prev,
-        patientId: demoPatients[0].id,
-        patientName: demoPatients[0].name,
-      }));
-      speak(`请选择就诊人。您的常用就诊人有：王大爷、李奶奶。已默认选择王大爷。`);
+      setPatients([]);
+      setSelectedPatientIndex(-1);
+      speak('就诊人信息加载失败，请返回重试。');
     }
   };
 
@@ -1217,41 +1187,76 @@ const VoiceRegisterPage: React.FC = () => {
               </h2>
               {loadingSlots ? (
                 <p className="text-[24px] text-center text-gray-600">正在查询号源...</p>
+              ) : timeSlots.length === 0 ? (
+                <div className="flex flex-col gap-4">
+                  <p className="text-[26px] text-center text-gray-700">
+                    该科室当前暂无可挂号源
+                  </p>
+                  <button
+                    onClick={() => void loadTimeSlots()}
+                    className="w-full h-20 bg-[#1A73E8] text-white text-[28px] font-bold rounded-xl hover:bg-[#1557b0] transition-colors"
+                  >
+                    重新查询
+                  </button>
+                  <button
+                    onClick={() => setCurrentStep(2)}
+                    className="w-full h-20 bg-white text-black text-[28px] font-bold rounded-xl border-3 border-black hover:bg-gray-100 transition-colors"
+                  >
+                    返回选择科室
+                  </button>
+                </div>
               ) : (
                 <>
-                  <div className="flex flex-col gap-3 max-h-[400px] overflow-y-auto">
-                    {timeSlots.map((slot: TimeSlot, index: number) => (
-                      <button
-                        key={slot.id}
-                        onClick={() => handleSelectSlot(index)}
-                        className={`w-full p-5 rounded-xl border-3 text-left transition-all ${
-                          selectedSlotIndex === index
-                            ? 'border-[#1A73E8] bg-blue-50'
-                            : 'border-black bg-white hover:border-[#1A73E8] active:bg-gray-50'
-                        }`}
-                        aria-label={`选择${slot.slotDate}${slot.slotPeriod}${slot.doctorName}的号`}
+                  <div className="flex flex-col gap-5 max-h-[560px] overflow-y-auto">
+                    {groupSlotsByDate(timeSlots).map((group) => (
+                      <div
+                        key={group.date}
+                        className="border-3 border-black rounded-xl p-4 flex flex-col gap-3"
                       >
-                        <div className="flex items-center justify-between">
-                          <div className="flex flex-col gap-2">
-                            <p className="text-[26px] font-bold text-black">
-                              {slot.slotDate} {slot.slotPeriod}
+                        <p className="text-[24px] font-bold text-black">📅 {group.date}</p>
+                        {group.periods.map(({ period, time, items }) => (
+                          <div key={period} className="flex flex-col gap-2">
+                            <p className="text-[22px] font-bold text-[#1A73E8]">
+                              {period}
+                              <span className="text-[20px] text-gray-600 font-normal">
+                                （{time} 出诊 · {items.length} 位医生）
+                              </span>
                             </p>
-                            <p className="text-[22px] text-gray-700">
-                              👨‍⚕️ {slot.doctorName}
-                              {slot.doctorTitle ? ` · ${slot.doctorTitle}` : ''}
-                            </p>
+                            {items.map(({ slot, index }) => (
+                              <button
+                                key={slot.id}
+                                onClick={() => handleSelectSlot(index)}
+                                className={`w-full p-4 rounded-xl border-3 text-left transition-all ${
+                                  selectedSlotIndex === index
+                                    ? 'border-[#1A73E8] bg-blue-50'
+                                    : 'border-gray-300 bg-white hover:border-[#1A73E8] active:bg-gray-50'
+                                }`}
+                                aria-label={`选择${group.date}${period}${slot.doctorName}的号`}
+                              >
+                                <div className="flex items-center justify-between">
+                                  <div className="flex flex-col gap-1">
+                                    <p className="text-[24px] font-bold text-black">
+                                      👨‍⚕️ {slot.doctorName}
+                                    </p>
+                                    <p className="text-[20px] text-gray-700">
+                                      {slot.doctorTitle ?? '医师'} · 挂号费 ¥{slot.fee}
+                                    </p>
+                                  </div>
+                                  <Badge
+                                    className={`text-[20px] px-3 py-1 rounded-full font-bold ${
+                                      slot.remainingQuota > 5
+                                        ? 'bg-[#137333] text-white'
+                                        : 'bg-[#E37400] text-white'
+                                    }`}
+                                  >
+                                    剩余 {slot.remainingQuota} 号
+                                  </Badge>
+                                </div>
+                              </button>
+                            ))}
                           </div>
-                          <Badge
-                            className={`text-[20px] px-3 py-1 rounded-full font-bold ${
-                              slot.remainingQuota > 5
-                                ? 'bg-[#137333] text-white'
-                                : 'bg-[#E37400] text-white'
-                            }`}
-                          >
-                            剩余 {slot.remainingQuota} 号
-                          </Badge>
-                        </div>
-                      </button>
+                        ))}
+                      </div>
                     ))}
                   </div>
                   <button
@@ -1272,6 +1277,9 @@ const VoiceRegisterPage: React.FC = () => {
               <h2 className="text-[32px] font-bold text-black text-center">
                 请选择就诊人
               </h2>
+              <p className="text-[20px] text-center text-gray-600">
+                以下为子女端维护的老人信息
+              </p>
               {patients.length > 0 ? (
                 <>
                   <div className="flex flex-col gap-3">
@@ -1292,16 +1300,9 @@ const VoiceRegisterPage: React.FC = () => {
                               {patient.name.charAt(0)}
                             </div>
                             <div className="flex flex-col gap-1">
-                              <div className="flex items-center gap-2">
-                                <p className="text-[26px] font-bold text-black">
-                                  {patient.name}
-                                </p>
-                                {patient.relation && (
-                                  <span className="text-[20px] text-gray-600">
-                                    {patient.relation}
-                                  </span>
-                                )}
-                              </div>
+                              <p className="text-[26px] font-bold text-black">
+                                {patient.name}
+                              </p>
                               {patient.phone && (
                                 <p className="text-[20px] text-gray-600">
                                   📞 {patient.phone}
@@ -1332,7 +1333,7 @@ const VoiceRegisterPage: React.FC = () => {
                   <p className="text-[26px] font-bold text-gray-600 mb-2">
                     还没有就诊人信息
                   </p>
-                  <p className="text-[22px] text-gray-500">请让子女帮您添加</p>
+                  <p className="text-[22px] text-gray-500">请让子女在子女端维护老人信息</p>
                 </div>
               )}
             </div>

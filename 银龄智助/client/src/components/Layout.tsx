@@ -1,5 +1,6 @@
 import React from 'react';
 import { NavLink, Outlet } from 'react-router-dom';
+import ElderVoiceAssistant from './ElderVoiceAssistant';
 
 const Layout = () => {
   return (
@@ -55,6 +56,9 @@ const Layout = () => {
           <Outlet />
         </div>
       </main>
+
+      {/* 老年端全程语音助手（挂号页使用分步骤专用助手） */}
+      <ElderVoiceAssistant />
     </div>
   );
 };

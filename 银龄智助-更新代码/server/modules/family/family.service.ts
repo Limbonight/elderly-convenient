@@ -18,7 +18,7 @@ import {
   doctors,
   patients,
 } from '@server/database/schema';
-import { eq, desc, and } from 'drizzle-orm';
+import { eq, desc, and, inArray } from 'drizzle-orm';
 import type {
   FamilyBinding,
   FamilyNotification,
@@ -234,19 +234,36 @@ export class FamilyService {
         userUpdate.phone = dto.elderPhone;
       }
       if (Object.keys(userUpdate).length > 0) {
+        // 记录修改前的姓名，用于精确同步就诊人记录（避免把其他就诊人一起改名）
+        const [beforeUser] = await tx
+          .select({ fullName: users.fullName })
+          .from(users)
+          .where(eq(users.id, binding.elderUserId))
+          .limit(1);
+        const oldName = beforeUser?.fullName ?? '';
+
         await tx
           .update(users)
           .set(userUpdate)
           .where(eq(users.id, binding.elderUserId));
 
-        // 同步更新老年端就诊人信息，保证子女端修改后老年端挂号时看到的是新信息
-        const patientUpdate: { fullName?: string; phone?: string } = {};
-        if (userUpdate.fullName) patientUpdate.fullName = userUpdate.fullName;
-        if (userUpdate.phone) patientUpdate.phone = userUpdate.phone;
-        await tx
-          .update(patients)
-          .set(patientUpdate)
-          .where(eq(patients.userId, binding.elderUserId));
+        // 同步老年端就诊人信息：只更新与该老人同名的记录，保证子女端改完老年端立刻可见
+        if (oldName) {
+          const patientUpdate: { fullName?: string; phone?: string } = {};
+          if (userUpdate.fullName) patientUpdate.fullName = userUpdate.fullName;
+          if (userUpdate.phone) patientUpdate.phone = userUpdate.phone;
+          if (Object.keys(patientUpdate).length > 0) {
+            await tx
+              .update(patients)
+              .set(patientUpdate)
+              .where(
+                and(
+                  eq(patients.userId, binding.elderUserId),
+                  eq(patients.fullName, oldName),
+                ),
+              );
+          }
+        }
       }
 
       // 更新绑定关系
@@ -272,6 +289,79 @@ export class FamilyService {
         isActive: binding.isActive ?? true,
       };
     });
+  }
+
+  /**
+   * 老年端挂号的"就诊人"候选：直接取子女端维护的老人信息（同一家庭组内的老人）。
+   * 不再返回"本人/配偶"这类关系标签，姓名/电话均为子女端最新修改后的内容。
+   */
+  async listRegistrationPatients(elderUserId: string): Promise<{
+    items: Array<{ id: string; name: string; phone: string }>;
+  }> {
+    // 1. 找到与该老人关联的家庭账号
+    const myBindings = await this.db
+      .select({ familyUserId: familyBindings.familyUserId })
+      .from(familyBindings)
+      .where(
+        and(
+          eq(familyBindings.elderUserId, elderUserId),
+          eq(familyBindings.isActive, true),
+        ),
+      );
+    const familyIds = [...new Set(myBindings.map((b) => b.familyUserId))];
+
+    // 2. 同一家庭账号下的全部老人
+    const elderIdSet = new Set<string>([elderUserId]);
+    if (familyIds.length > 0) {
+      const siblings = await this.db
+        .select({ elderUserId: familyBindings.elderUserId })
+        .from(familyBindings)
+        .where(
+          and(
+            inArray(familyBindings.familyUserId, familyIds),
+            eq(familyBindings.isActive, true),
+          ),
+        );
+      siblings.forEach((s) => elderIdSet.add(s.elderUserId));
+    }
+
+    const elderUsers = await this.db
+      .select({ id: users.id, fullName: users.fullName, phone: users.phone })
+      .from(users)
+      .where(inArray(users.id, [...elderIdSet]));
+
+    // 3. 每位老人各自维护一条就诊人记录，缺失的补建，保证挂号可写入 patientId。
+    //    记录归属到老人本人（userId = 老人 id），这样子女端改名后能精确同步到对应就诊人。
+    const existing = await this.db
+      .select({ id: patients.id, userId: patients.userId, fullName: patients.fullName })
+      .from(patients)
+      .where(inArray(patients.userId, [...elderIdSet]));
+
+    const items: Array<{ id: string; name: string; phone: string }> = [];
+    const seen = new Set<string>();
+    for (const u of elderUsers) {
+      const name = (u.fullName ?? '').trim();
+      if (!name || seen.has(name)) continue;
+      seen.add(name);
+
+      let patientId = existing.find((p) => p.userId === u.id && p.fullName === name)?.id;
+      if (!patientId) {
+        const [created] = await this.db
+          .insert(patients)
+          .values({
+            userId: u.id,
+            fullName: name,
+            phone: u.phone ?? '',
+            isDefault: false,
+          })
+          .returning({ id: patients.id });
+        patientId = created.id;
+        existing.push({ id: created.id, userId: u.id, fullName: name });
+      }
+      items.push({ id: patientId, name, phone: u.phone ?? '' });
+    }
+
+    return { items };
   }
 
   async listNotifications(

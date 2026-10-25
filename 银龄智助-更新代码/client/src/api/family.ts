@@ -23,16 +23,16 @@ export interface FamilyNotification {
 }
 
 export function getDemoFamilyUserId(): string {
+  // 固定演示家庭账号：与数据库种子数据保持一致，避免浏览器随机 id 导致子女端与老年端数据对不上
+  const DEMO_FAMILY_ID = 'demo_family_001';
   try {
-    let id = localStorage.getItem('demoFamilyUserId');
-    if (!id) {
-      id = 'fam_' + Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
-      localStorage.setItem('demoFamilyUserId', id);
+    if (localStorage.getItem('demoFamilyUserId') !== DEMO_FAMILY_ID) {
+      localStorage.setItem('demoFamilyUserId', DEMO_FAMILY_ID);
     }
-    return id;
   } catch {
-    return 'fam_unknown';
+    // 忽略隐私模式下的存储错误
   }
+  return DEMO_FAMILY_ID;
 }
 
 export async function getFamilyMembers(): Promise<FamilyMember[]> {
@@ -48,6 +48,29 @@ export async function getFamilyMembers(): Promise<FamilyMember[]> {
     return Array.isArray(data) ? data : (data?.items ?? []);
   } catch (error) {
     logger.error('获取家人列表失败', error);
+    throw error;
+  }
+}
+
+export interface RegistrationPatient {
+  id: string;
+  name: string;
+  phone: string;
+}
+
+/** 老年端挂号可选的就诊人：直接来自子女端维护的老人信息 */
+export async function getRegistrationPatients(elderUserId: string): Promise<RegistrationPatient[]> {
+  try {
+    const response = await axiosForBackend({
+      url: '/api/family/registration-patients',
+      method: 'GET',
+      params: { elderUserId, _t: Date.now() },
+      headers: noCacheHeaders,
+    });
+    const data = response.data;
+    return Array.isArray(data) ? data : (data?.items ?? []);
+  } catch (error) {
+    logger.error('获取挂号就诊人失败', error);
     throw error;
   }
 }

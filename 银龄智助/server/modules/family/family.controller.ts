@@ -74,6 +74,16 @@ export class FamilyController {
     return { success: true };
   }
 
+  @Get('registration-patients')
+  async listRegistrationPatients(
+    @Query('elderUserId') elderUserId: string,
+  ): Promise<{ items: Array<{ id: string; name: string; phone: string }> }> {
+    if (!elderUserId) {
+      throw new BadRequestException('elderUserId 不能为空');
+    }
+    return this.familyService.listRegistrationPatients(elderUserId);
+  }
+
   @Get('notifications')
   async listNotifications(
     @Query('familyUserId') familyUserId: string,
